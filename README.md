@@ -1,101 +1,120 @@
-# ConFiner-re
-Reproduce the Confiner framework for training-free video generation enhancement.
 
-## Recommend Environment
-- Ubuntu 20.04
-- Python 3.8
-- Pytorch 2.1.0
-- CUDA 11.8
+# MoEfication
 
-## Installation
-1. create a virtual environment using python 3.8
-```bash
-conda create --name confiner python=3.8 -y
-conda activate confiner
+Source code for "[MoEfication: Transformer Feed-forward Layers are Mixtures of Experts](https://arxiv.org/abs/2110.01786)" and "[Exploring the Benefit of Activation Sparsity in Pre-training](https://openreview.net/forum?id=KfXXPCcobh)"
+
+**Important Update (2024/07/21)**: In addition to the original work, this repository now contains [subsequent research](https://openreview.net/forum?id=KfXXPCcobh) that provides a **faster and better parameter clustering method** by incorporating GPUs and initialization from previous results. We encourage users to use the new contributions when considering **MoEfication during training**. This method is detailed in the [faster_moefication](./faster_moefication/README.md).
+
+**Update (2022/11/30):** We provide a simple example of using fastmoe for efficient MoE implementation in the branch [fastmoe](https://github.com/thunlp/MoEfication/tree/fastmoe). We will provide how to transform a MoEfied checkpoint to a fastmoe checkpoint soon. Keep tuned!
+
+## Reqirements:
+
+* Python3.8
+* torch==1.6.0
+* transformers==4.20.1
+* tqdm
+* scikit-learn
+* k_means_constrained
+* datasets
+* numpy
+* scipy
+
+## Expert Construction
+
+For parameter clustering split, we use balanced K-Means. The details of the implementation can be found in `param_cluster_example.py`.
+
+For co-activation graph split, we first construct a co-activation graph by `adj.py`. For T5, the output graphs are named as `encoder.blocks.0.ff.dense_relu_dense.wi.weight`, `encoder.blocks.1.ff.dense_relu_dense.wi.weight`, ..., `decoder.blocks.11.ff.dense_relu_dense.wi.weight`, which are the weight names.
+
+Then, we use [METIS](http://glaros.dtc.umn.edu/gkhome/metis/metis/download) to split the graph into subgraphs.
 ```
-2. install the depencdencies of video diffusion models
-for animatediff-lightning, stablediffusion v1.5 and modelscope:
-```bash
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu118
+gpmetis encoder.blocks.0.ff.dense_relu_dense.wi.weight num_expert
 ```
-3. fix the bugs of the environment
-we first update environment variables:
-```bash
-export LD_LIBRARY_PATH=/home/zhongyu.zhao/miniconda3/envs/confiner/lib/python3.8/site-packages/torch/lib:LD_LIBRARY_PATH
+where `num_expert` is the number of experts.
+
+Finally, we balance the neurons in each expert.
 ```
-and check if torch can support FP8:
-```python
-python -c "
-import torch; 
-print('FP8 TYPE I :', torch.float8_e4m3fn); 
-print('FP8 TYPE II:', torch.float8_e5m2)
-"
-```
-then install some dependencies to fix the possible bugs of lavie:
-```
-pip uninstall xformers
-pip install ninja
-# for H100, H800 series GPUs
-TORCH_CUDA_ARCH_LIST='9.0' pip install -v -U git+https://github.com/facebookresearch/xformers.git@v0.0.20#egg=xformers
+# num_expert=128
+python trans_gp.py encoder.blocks.0.ff.dense_relu_dense.wi.weight.part.128
 ```
 
-## Environment Check
-### Quick Start
-according to the documents from these video diffusion model repos, we can easily use the models to generate videos.
-- Stable Diffusion v1.5
-```python
-from diffusers import StableDiffusionPipeline
-import torch
+## Expert Selection
 
-model_id = "sd-legacy/stable-diffusion-v1-5"
-pipe = StableDiffusionPipeline.from_pretrained(model_id, torch_dtype=torch.float16)
-pipe = pipe.to("cuda")
+For similarity selection, we average the corresponding weight columns as the expert representation. The details of the implementation can be found in `similarity_select_example.py`.
 
-prompt = "a photo of an astronaut riding a horse on mars"
-image = pipe(prompt).images[0]  
-    
-image.save("astronaut_rides_horse.png")
+For MLP selection, We train a multi-layer perceptron (MLP), which takes the $\vx$ as input and predicts the sum of positive values in each expert. The details of the implementation can be found in `mlp_select_example.py`.
+
+## T5 Examples
+
+We provide an example of T5-base on SST-2 in `examples`, including groundtruth selection and MLP selection based on parameter clustering.
+
+First, you need to construct expert by 
+
 ```
-- Animatediff-Lightning
-```python
-import torch
-from diffusers import AnimateDiffPipeline, MotionAdapter, EulerDiscreteScheduler
-from diffusers.utils import export_to_gif
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
-
-device = "cuda"
-dtype = torch.float16
-
-step = 4  # Options: [1,2,4,8]
-repo = "ByteDance/AnimateDiff-Lightning"
-ckpt = f"animatediff_lightning_{step}step_diffusers.safetensors"
-base = "emilianJR/epiCRealism"  # Choose to your favorite base model.
-
-adapter = MotionAdapter().to(device, dtype)
-adapter.load_state_dict(load_file(hf_hub_download(repo ,ckpt), device=device))
-pipe = AnimateDiffPipeline.from_pretrained(base, motion_adapter=adapter, torch_dtype=dtype).to(device)
-pipe.scheduler = EulerDiscreteScheduler.from_config(pipe.scheduler.config, timestep_spacing="trailing", beta_schedule="linear")
-
-output = pipe(prompt="A girl smiling", guidance_scale=1.0, num_inference_steps=step)
-export_to_gif(output.frames[0], "animation.gif")
+python examples/t5_cluster_example.py
 ```
-- LaVie
-see repo docs for more details.
-- ModelScope
-```python
-from modelscope.pipelines import pipeline
-from modelscope.outputs import OutputKeys
 
-p = pipeline('text-to-video-synthesis', 'damo/text-to-video-synthesis')
-test_text = {
-        'text': 'A panda eating bamboo on a rock.',
-    }
-output_video_path = p(test_text, output_video='./output.mp4')[OutputKeys.OUTPUT_VIDEO]
-print('output_video_path:', output_video_path)
+Then, you can directly evaluate groundtruth selection by 
+
 ```
-## Acknowledgement
-- [Stable Diffusion v1.5](https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5)
-- [Animatediff-Lightning](https://huggingface.co/ByteDance/AnimateDiff-Lightning)
-- [LaVie](https://github.com/Vchitect/LaVie)
-- [ModelScope](https://modelscope.cn/models/iic/text-to-video-synthesis/summary)
+python examples/t5-sst2-gt.py
+```
+
+To use MLP selection, you need to train the MLP by 
+
+```
+python examples/t5-sst2-inf.py
+python examples/t5_select_example.py 
+```
+
+And, you can evaluate the performance of MLP selection by 
+
+```
+python examples/t5-sst2-mlp.py
+```
+
+## BERT Examples
+
+We also provide an example of BERT-large on SST-2 in `examples`. The checkpoint of ReLU-based BERT is available [here](https://cloud.tsinghua.edu.cn/f/cce7d1c994904f0f81bd/?dl=1). 
+
+You need to first download it and fine-tune it on SST-2 by 
+
+```
+python examples/bert-sst2-training.py
+```
+
+Then, you need to construct expert by 
+
+```
+python moefication/param_cluster_example.py --model_path bert-sst2-bsz32/epoch_1.bin --res_path results/bert-sst2 --num-layer 24 --num-expert 128 --templates bert.encoder.layer.{}.intermediate.dense.weight
+```
+
+you can evaluate groundtruth selection by 
+
+```
+python examples/bert-sst2-gt.py
+```
+
+### Tips for Training ReLU-based BERT
+
+We use the pre-training script from [NVIDIA](https://github.com/NVIDIA/DeepLearningExamples/tree/master/PyTorch/LanguageModeling/BERT). The only difference is that we replace the activation function with ReLU and set the bias of the intermediate layer to None. We initialize the model with the checkpoint of [BERT-Large-Uncased](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/dle/models/bert_large_pyt_ckpt_mode-pretrain) provided by NVIDIA. In the experiments, we found that training around 200 steps is enough to get a good performance.
+
+## Cite
+
+If you use the code, please cite this paper:
+
+```
+@inproceedings{
+  zhang2024exploring,
+  title={Exploring the Benefit of Activation Sparsity in Pre-training},
+  author={Zhengyan Zhang and Chaojun Xiao and Qiujieli Qin and Yankai Lin and Zhiyuan Zeng and Xu Han and Zhiyuan Liu and Ruobing Xie and Maosong Sun and Jie Zhou},
+  booktitle={Proceedings of ICML},
+  year={2024},
+}
+
+@inproceedings{zhang2022moefication,
+  title={{MoEfication}: Transformer Feed-forward Layers are Mixtures of Experts},
+  author={Zhang, Zhengyan and Lin, Yankai and Liu, Zhiyuan and Li, Peng and Sun, Maosong and Zhou, Jie},
+  booktitle={Findings of ACL 2022},
+  year={2022}
+}
+```
